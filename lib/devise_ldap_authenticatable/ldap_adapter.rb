@@ -3,6 +3,7 @@ require "net/ldap"
 module Devise
   module LdapAdapter
     DEFAULT_GROUP_UNIQUE_MEMBER_LIST_KEY = 'uniqueMember'
+    DEFAULT_LDAP_CONFIG_FILE = "#{Rails.root}/config/ldap.yml"
 
     def self.valid_credentials?(login, password_plaintext)
       options = {:login => login,
@@ -20,7 +21,7 @@ module Devise
                  :ldap_auth_username_builder => ::Devise.ldap_auth_username_builder,
                  :admin => ::Devise.ldap_use_admin_to_bind}
 
-      resource = LdapConnect.new(options)
+      resource = LdapConnectPool.new(options)
       resource.change_password! if new_password.present?
     end
 
@@ -33,7 +34,7 @@ module Devise
                  :ldap_auth_username_builder => ::Devise.ldap_auth_username_builder,
                  :admin => ::Devise.ldap_use_admin_to_bind}
 
-      resource = LdapConnect.new(options)
+      resource = LdapConnectPool.new(options)
     end
 
     def self.valid_login?(login)
@@ -57,7 +58,7 @@ module Devise
                   :ldap_auth_username_builder => ::Devise.ldap_auth_username_builder,
                   :password => password }
 
-      resource = LdapConnect.new(options)
+      resource = LdapConnectPool.new(options)
       resource.set_param(param, new_value)
     end
 
@@ -66,7 +67,7 @@ module Devise
                   :ldap_auth_username_builder => ::Devise.ldap_auth_username_builder,
                   :password => password }
 
-      resource = LdapConnect.new(options)
+      resource = LdapConnectPool.new(options)
       resource.delete_param(param)
     end
 
@@ -79,12 +80,74 @@ module Devise
       self.ldap_connect(login).search_for_login
     end
 
+
+    class LdapConnectPool
+      def initialize(params={})
+        @ldap_configs = YAML.load(ERB.new(File.read(::Devise.ldap_config || DEFAULT_LDAP_CONFIG_FILE)).result)[Rails.env]
+        @ldap_configs = [@ldap_configs].flatten
+
+        @pool = @ldap_configs.map{|ldap_config| LdapConnect.new(params, ldap_config)}
+        @active = @pool.first
+      end
+
+      proxy_methods = [
+      :dn,
+      :authenticate!,
+      :authenticate?,
+      :has_required_attribute?,
+      :in_ldap_group?,
+      :in_required_groups?,
+      :ldap_param_value,
+      :search_for_login,
+      :update_ldap,
+      :user_groups?,
+      :valid_login?,
+      ]
+      proxy_methods.each do |method|
+        define_method method do |*args|
+          each_until_return(method, *args)
+        end
+      end
+
+      proxy_methods_fire_all = [
+        :change_password!,
+        :delete_param,
+        :set_param,
+      ]
+      proxy_methods_fire_all.each do |method|
+        define_method method do |*args|
+          each_unless_readonly(method, *args)
+        end
+      end
+
+      private
+
+      def each_unless_readonly(method, *args)
+        @pool.each do |ldap|
+          ldap.send(method, *args) unless ldap.readonly?
+        end
+      end
+
+      def each_until_return(method, *args)
+        @pool.each do |ldap|
+          begin
+            return ldap.send(method, *args)
+          rescue LdapError => e
+            Rails.logger.warn("#{method} failed on #{ldap}: #{e}")
+          end
+        end
+      end
+
+    end
+
+
     class LdapConnect
 
       attr_reader :ldap, :login
+      attr_accessor :readonly
 
-      def initialize(params = {})
-        ldap_config = YAML.load(ERB.new(File.read(::Devise.ldap_config || "#{Rails.root}/config/ldap.yml")).result)[Rails.env]
+      def initialize(params = {}, ldap_config=nil)
+        ldap_config ||= YAML.load(ERB.new(File.read(::Devise.ldap_config || DEFAULT_LDAP_CONFIG_FILE)).result)[Rails.env]
         ldap_options = params
         ldap_config["ssl"] = :simple_tls if ldap_config["ssl"] === true
         ldap_options[:encryption] = ldap_config["ssl"].to_sym if ldap_config["ssl"]
@@ -100,6 +163,7 @@ module Devise
         @check_group_membership = ldap_config.has_key?("check_group_membership") ? ldap_config["check_group_membership"] : ::Devise.ldap_check_group_membership
         @required_groups = ldap_config["required_groups"]
         @required_attributes = ldap_config["require_attribute"]
+        @readonly = ldap_config["readonly"] || false
 
         @ldap.auth ldap_config["admin_user"], ldap_config["admin_password"] if params[:admin]
 
@@ -248,7 +312,7 @@ module Devise
       private
 
       def self.admin
-        ldap = LdapConnect.new(:admin => true).ldap
+        ldap = LdapConnectPool.new(:admin => true).ldap
 
         unless ldap.bind
           DeviseLdapAuthenticatable::Logger.send("Cannot bind to admin LDAP user")
